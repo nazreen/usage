@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -167,6 +168,90 @@ class UsageTests(unittest.TestCase):
         self.run_cli()
         self.run_cli("--pick")
         self.assertEqual(len(self.requests), 3)
+
+    CLAUDE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+    def claude_requests(self):
+        return [r for r in self.requests if r.full_url == self.CLAUDE_URL]
+
+    def write_snapshot(self, written_ago=10, week_reset_in=timedelta(days=2), used=40):
+        cache = Path(self.cli.CACHE_DIR)
+        cache.mkdir(exist_ok=True)
+        (cache / "claude-statusline.json").write_text(json.dumps({
+            "written_at": self.now.timestamp() - written_ago,
+            "rate_limits": {
+                "seven_day": {"used_percentage": used,
+                              "resets_at": (self.now + week_reset_in).timestamp()},
+                "five_hour": {"used_percentage": 20,
+                              "resets_at": (self.now + timedelta(hours=2)).timestamp()}}}))
+
+    def rate_limit_claude(self, retry_after="600"):
+        self.payloads[self.CLAUDE_URL] = urllib.error.HTTPError(
+            self.CLAUDE_URL, 429, "Too Many Requests", {"Retry-After": retry_after}, None)
+
+    def test_recent_statusline_snapshot_replaces_claude_request(self):
+        self.write_snapshot()
+        _, output = self.run_cli("--agent")
+        claude = json.loads(output)["harnesses"]["claude-code"]
+        self.assertEqual(claude["source"], "statusline")
+        self.assertEqual(claude["weekly"]["used_pct"], 40)
+        self.assertEqual(claude["five_hour"]["used_pct"], 20)
+        self.assertEqual(self.claude_requests(), [])
+
+    def test_old_or_rolled_over_snapshot_falls_back_to_api(self):
+        for kwargs in ({"written_ago": self.cli.STATUSLINE_MAX_AGE + 60},
+                       {"week_reset_in": timedelta(seconds=-1)}):
+            self.write_snapshot(**kwargs)
+            for f in Path(self.cli.CACHE_DIR).glob("claude-code.*"):
+                f.unlink()
+            self.requests.clear()
+            _, output = self.run_cli("--agent")
+            claude = json.loads(output)["harnesses"]["claude-code"]
+            self.assertEqual(claude["source"], "api")
+            self.assertEqual(claude["weekly"]["used_pct"], 30)
+            self.assertEqual(len(self.claude_requests()), 1)
+
+    def test_claude_response_cached_longer_than_codex(self):
+        self.run_cli()
+        old = time.time() - 120
+        for name in ("claude-code", "codex", "codex-resets"):
+            os.utime(Path(self.cli.CACHE_DIR) / f"{name}.json", (old, old))
+        self.requests.clear()
+        self.run_cli()
+        self.assertEqual(self.claude_requests(), [])
+        self.assertEqual(len(self.requests), 2)
+
+    def test_429_shows_stale_cache_and_waits_out_retry_after(self):
+        self.run_cli()
+        old = time.time() - 900
+        os.utime(Path(self.cli.CACHE_DIR) / "claude-code.json", (old, old))
+        self.rate_limit_claude()
+        _, output = self.run_cli("--agent")
+        result = json.loads(output)
+        self.assertEqual(result["harnesses"]["claude-code"]["stale_minutes"], 15)
+        self.assertEqual(result["harnesses"]["claude-code"]["weekly"]["used_pct"], 30)
+        _, output = self.run_cli()
+        self.assertIn("(stale 15m, rate limited)", output)
+        self.assertEqual(len(self.claude_requests()), 2)
+
+    def test_429_without_cache_errors_and_does_not_retry_early(self):
+        self.rate_limit_claude(retry_after="0")
+        _, output = self.run_cli("--agent")
+        claude = json.loads(output)["harnesses"]["claude-code"]
+        self.assertIn("rate limited (HTTP 429), retry in 4m", claude["error"])
+        self.assertEqual(self.run_cli("--pick"), (0, "codex\n"))
+        self.assertEqual(len(self.claude_requests()), 1)
+
+    def test_success_after_retry_after_clears_block(self):
+        self.rate_limit_claude()
+        self.run_cli()
+        blocked = Path(self.cli.CACHE_DIR) / "claude-code.blocked"
+        blocked.write_text(str(time.time() - 1))
+        self.payloads[self.CLAUDE_URL] = {"seven_day": {
+            "utilization": 30, "resets_at": (self.now + timedelta(days=3.5)).isoformat()}}
+        _, output = self.run_cli("--agent")
+        self.assertNotIn("stale_minutes", json.loads(output)["harnesses"]["claude-code"])
+        self.assertFalse(blocked.exists())
 
     def test_help_does_not_fetch_usage(self):
         code, output = self.run_cli("--help")
