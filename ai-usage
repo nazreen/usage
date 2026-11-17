@@ -4,9 +4,11 @@
 Uses the same endpoints as CodexBar / claude-monitor style tools:
 - Claude: GET api.anthropic.com/api/oauth/usage (token from macOS keychain)
 - Codex:  GET chatgpt.com/backend-api/wham/usage (token from ~/.codex/auth.json)
+- Resets: GET chatgpt.com/backend-api/wham/rate-limit-reset-credits (same Codex token)
 
 --agent prints JSON for agents choosing a harness: it recommends the one
-whose weekly usage is furthest behind the time elapsed in its week.
+with the lowest weekly pace, subtracting 100 points per available Codex reset.
+Banked resets are displayed but never redeemed; current quota must still be usable.
 
 --pick prints only the recommended harness name, or "none" and exits 1.
 """
@@ -88,7 +90,8 @@ def claude():
 
 
 def codex():
-    auth = json.load(open(os.path.expanduser("~/.codex/auth.json")))
+    with open(os.path.expanduser("~/.codex/auth.json")) as f:
+        auth = json.load(f)
     t = auth["tokens"]
     h = {"Authorization": f"Bearer {t['access_token']}"}
     if t.get("account_id"):
@@ -107,7 +110,47 @@ def codex():
             out["five_hour"] = window(w.get("used_percent"), reset, secs)
         elif secs >= 6 * 86400 or len(wins) == 1:
             out["weekly"] = window(w.get("used_percent"), reset, secs)
+    try:
+        out["resets"] = codex_resets(h)
+    except Exception as e:
+        # Reset metadata is optional: keep ordinary usage and recommendations working.
+        out["resets"] = {"available_count": None, "error": str(e)}
     return out
+
+
+def codex_resets(headers):
+    d = get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+            headers, "codex-resets")
+    now = datetime.now(timezone.utc)
+    expirations = []
+    for credit in d["credits"]:
+        if credit.get("status") != "available" or credit.get("is_supported_by_plan") is not True:
+            continue
+        if credit.get("reset_type") != "codex_rate_limits":
+            continue
+        expiry = datetime.fromisoformat(credit["expires_at"].replace("Z", "+00:00"))
+        # Recheck expiration even when the response came from the cache.
+        if expiry > now:
+            expirations.append(expiry.astimezone(timezone.utc).isoformat())
+    expirations.sort()
+    return {"available_count": len(expirations), "expires_at": expirations}
+
+
+def reset_count(d):
+    return (d.get("resets") or {}).get("available_count") or 0
+
+
+def selection_pace(d):
+    return d["weekly"]["pace_delta_pct"] - 100 * reset_count(d)
+
+
+def pace_description(name, d):
+    delta = d["weekly"]["pace_delta_pct"]
+    description = f"{name} weekly usage is {abs(delta)} pts {'behind' if delta < 0 else 'ahead of'} week elapsed"
+    count = reset_count(d)
+    if count:
+        description += f"; {count} banked reset{'s' if count != 1 else ''}, selection pace {selection_pace(d):+} pts"
+    return description
 
 
 def until(dt):
@@ -148,16 +191,30 @@ def seg(label, w, marker, left_color):
     return f"{c(DIM, label)} [{''.join(cells)}] {pct} used {reset}"
 
 
+def reset_seg(resets):
+    count = resets.get("available_count")
+    if count is None:
+        return "resets unknown"
+    text = f"resets {count}"
+    if count and resets.get("expires_at"):
+        expiry = datetime.fromisoformat(resets["expires_at"][0])
+        text += f" (next expires in {until(expiry)})"
+    return text
+
+
 def recommend(data):
     """Return (harness, reason, unavailable, wait).
 
     unavailable lists harnesses with no data. wait names a harness skipped only for its
-    5-hour window that resets within WAIT_MINUTES and has a better weekly pace than the
+    5-hour window that resets within WAIT_MINUTES and has a better selection pace than the
     recommended one (or there is no recommended one); otherwise it is None.
     """
     candidates, unavailable, skipped, waitable = [], [], [], []
     for name, d in data.items():
         wk, fh = d.get("weekly"), d.get("five_hour")
+        count = reset_count(d)
+        reset_hint = (f"; {count} banked reset{'s' if count != 1 else ''} available, redeem one to restore quota"
+                      if count else "")
         if "error" in d or not (wk or fh) or (wk and "pace_delta_pct" not in wk):
             unavailable.append(name)
             continue
@@ -166,31 +223,36 @@ def recommend(data):
             skipped.append(f"{name} skipped: no weekly window")
             continue
         if wk["left_pct"] <= 0:
-            skipped.append(f"{name} skipped: weekly quota used up")
+            skipped.append(f"{name} skipped: weekly quota used up" + reset_hint)
             continue
         if fh and fh["left_pct"] < MIN_5H_LEFT:
-            skipped.append(f"{name} skipped: 5h window at {fh['left_pct']:.0f}%, resets in {until(fh['_reset'])}")
+            skipped.append(f"{name} skipped: 5h window at {fh['left_pct']:.0f}%, resets in {until(fh['_reset'])}" + reset_hint)
             if fh["_reset"]:
                 mins = (fh["_reset"] - datetime.now(timezone.utc)).total_seconds() / 60
                 if mins <= WAIT_MINUTES:
-                    waitable.append((wk["pace_delta_pct"], name, max(0, int(mins))))
+                    waitable.append((selection_pace(d), name, max(0, int(mins))))
             continue
-        candidates.append((wk["pace_delta_pct"], name))
+        candidates.append((selection_pace(d), name))
     notes = [f"{n} skipped: no usage data" for n in unavailable] + skipped
     candidates.sort()
     waitable.sort()
     wait = None
     if waitable and (not candidates or waitable[0][0] < candidates[0][0]):
         delta, name, mins = waitable[0]
-        wait = {"harness": name, "resets_in_minutes": mins, "pace_delta_pct": delta}
+        wait = {"harness": name, "resets_in_minutes": mins,
+                "pace_delta_pct": data[name]["weekly"]["pace_delta_pct"],
+                "selection_pace_pct": delta}
         notes.append(f"or wait {until(data[name]['five_hour']['_reset'])} for {name} "
-                     f"(weekly pace {delta:+} pts)")
+                     f"(selection pace {delta:+} pts)")
     if not candidates:
         return None, "; ".join(notes or ["no harness has usable quota data"]), unavailable, wait
-    delta, name = candidates[0]
-    reason = f"{name} weekly usage is {abs(delta)} pts {'behind' if delta < 0 else 'ahead of'} week elapsed"
+    _, name = candidates[0]
+    reason = pace_description(name, data[name])
     if len(candidates) > 1:
-        reason += f"; {candidates[1][1]} is {candidates[1][0]:+} pts"
+        other = candidates[1][1]
+        reason += f"; {other} selection pace is {candidates[1][0]:+} pts"
+        if reset_count(data[other]):
+            reason += f" ({reset_count(data[other])} banked resets)"
     return name, "; ".join([reason] + notes), unavailable, wait
 
 
@@ -199,43 +261,56 @@ def strip(d):
                 if isinstance(v, dict) else v) for k, v in d.items()}
 
 
-if {"-h", "--help"} & set(sys.argv[1:]):
-    print(__doc__.strip())
-    sys.exit(0)
+def main():
+    if {"-h", "--help"} & set(sys.argv[1:]):
+        print(__doc__.strip())
+        return 0
 
-data = {}
-for name, fn in (("claude-code", claude), ("codex", codex)):
-    try:
-        data[name] = fn()
-    except Exception as e:
-        data[name] = {"error": str(e)}
+    data = {}
+    for name, fn in (("claude-code", claude), ("codex", codex)):
+        try:
+            data[name] = fn()
+        except Exception as e:
+            data[name] = {"error": str(e)}
+    for d in data.values():
+        if "pace_delta_pct" in d.get("weekly", {}):
+            d["selection_pace_pct"] = selection_pace(d)
 
-if "--pick" in sys.argv[1:]:
-    rec = recommend(data)[0]
-    print(rec or "none")
-    sys.exit(0 if rec else 1)
-elif "--agent" in sys.argv[1:]:
-    rec, reason, unavailable, wait = recommend(data)
-    print(json.dumps({
-        "recommended_harness": rec,
-        "reason": reason,
-        "unavailable_harnesses": unavailable,
-        "wait_option": wait,
-        "rule": "prefer the harness with the lowest weekly pace_delta_pct (used_pct - elapsed_pct); "
-                f"skip any with 0% weekly left or under {MIN_5H_LEFT:.0f}% five_hour left; "
-                f"wait_option names a skipped harness whose five_hour window resets within "
-                f"{WAIT_MINUTES} min and whose weekly pace is better",
-        "harnesses": {k: strip(v) for k, v in data.items()},
-    }, indent=2))
-else:
-    for name, label in (("claude-code", "Claude Code"), ("codex", "Codex")):
-        d = data[name]
-        if "error" in d:
-            print(f"{c(LABEL, f'{label:<12}')}error: {d['error']}")
-            continue
-        parts = [seg("wk", d["weekly"], True, TOOL_COLOR[name])] if "weekly" in d else []
-        if "five_hour" in d:
-            parts.append(seg("5h", d["five_hour"], False, TOOL_COLOR[name]))
-        print(c(LABEL, f"{label:<12}") + "   ".join(parts))
-    rec, reason, _, _ = recommend(data)
-    print(c(LABEL, f"{'Use':<12}") + c(OK, rec or "none") + " " + c(DIM, f"({reason})"))
+    if "--pick" in sys.argv[1:]:
+        rec = recommend(data)[0]
+        print(rec or "none")
+        return 0 if rec else 1
+    elif "--agent" in sys.argv[1:]:
+        rec, reason, unavailable, wait = recommend(data)
+        print(json.dumps({
+            "recommended_harness": rec,
+            "reason": reason,
+            "unavailable_harnesses": unavailable,
+            "wait_option": wait,
+            "rule": "prefer the harness with the lowest selection_pace_pct "
+                    "(weekly pace_delta_pct minus 100 points per unexpired, supported banked reset); "
+                    f"skip any with 0% weekly left or under {MIN_5H_LEFT:.0f}% five_hour left; "
+                    "resets are never redeemed, and unknown reset counts give no bonus; "
+                    f"wait_option names a skipped harness whose five_hour window resets within "
+                    f"{WAIT_MINUTES} min and whose selection pace is better",
+            "harnesses": {k: strip(v) for k, v in data.items()},
+        }, indent=2))
+    else:
+        for name, label in (("claude-code", "Claude Code"), ("codex", "Codex")):
+            d = data[name]
+            if "error" in d:
+                print(f"{c(LABEL, f'{label:<12}')}error: {d['error']}")
+                continue
+            parts = [seg("wk", d["weekly"], True, TOOL_COLOR[name])] if "weekly" in d else []
+            if "five_hour" in d:
+                parts.append(seg("5h", d["five_hour"], False, TOOL_COLOR[name]))
+            if "resets" in d:
+                parts.append(reset_seg(d["resets"]))
+            print(c(LABEL, f"{label:<12}") + "   ".join(parts))
+        rec, reason, _, _ = recommend(data)
+        print(c(LABEL, f"{'Use':<12}") + c(OK, rec or "none") + " " + c(DIM, f"({reason})"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
