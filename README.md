@@ -73,7 +73,27 @@ It calls the same endpoints the official clients use:
 
 Tokens are read at run time and sent only to those two hosts. They are never written to disk. All requests are read-only; no resets are redeemed.
 
-Each API response is cached for 60 seconds in `~/.cache/ai-usage/` (or `$XDG_CACHE_HOME/ai-usage/`), with file mode `600`, so repeated runs don't hit rate limits. Failed requests are not cached.
+Each API response is cached in `~/.cache/ai-usage/` (or `$XDG_CACHE_HOME/ai-usage/`), with file mode `600`: Codex for 60 seconds, Claude for 5 minutes. Failed requests are not cached.
+
+### Claude rate limits (HTTP 429)
+
+Anthropic's `/api/oauth/usage` endpoint allows only a few requests per access token, then returns HTTP 429 for up to an hour ([anthropics/claude-code#30930](https://github.com/anthropics/claude-code/issues/30930)). Claude Code's own sessions use the same token, so the limit can be spent before `ai-usage` runs.
+
+- **Statusline snapshot.** Claude Code 2.1.80+ passes `rate_limits` to its statusline script on stdin. If your statusline saves them, `ai-usage` reads the snapshot instead of calling the endpoint. A snapshot is used when it is under 10 minutes old and none of its windows has reset since it was written. Add this to your statusline script, where `$input` holds the JSON from stdin:
+
+  ```sh
+  # Save Claude rate limits for ai-usage, so it need not call the rate-limited usage endpoint.
+  if printf '%s' "$input" | jq -e '.rate_limits.seven_day' >/dev/null 2>&1; then
+    (d="${XDG_CACHE_HOME:-$HOME/.cache}/ai-usage"; umask 077; mkdir -p "$d" &&
+     printf '%s' "$input" | jq -c '{written_at: now, rate_limits}' > "$d/claude-statusline.json.$$" &&
+     mv -f "$d/claude-statusline.json.$$" "$d/claude-statusline.json")
+  fi
+  ```
+
+  The snapshot does not name the account. If you run Claude Code under more than one account (for example with `CLAUDE_CONFIG_DIR`), the last session to refresh its statusline wins.
+- **Back-off.** On a 429, `ai-usage` sends no request to that endpoint until `Retry-After` passes (5 minutes when it is missing or `0`). Meanwhile it shows the last good response up to 3 hours old, marked `(stale Nm, rate limited)`; `--agent` adds `stale_minutes`. With no cached response, the tool shows an error with the wait time, and the other harness is still recommended.
+
+`--agent` reports Claude's `source` as `statusline` or `api`.
 
 These endpoints are not documented public APIs. They can change or break without notice.
 
