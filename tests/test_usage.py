@@ -114,6 +114,26 @@ class UsageTests(unittest.TestCase):
         resets = json.loads(output)["harnesses"]["codex"]["resets"]
         self.assertEqual(resets, {"available_count": 2, "expires_at": [earlier, self.expiry]})
 
+    def test_expiring_weekly_quota_beats_banked_resets(self):
+        week = self.payloads["https://api.anthropic.com/api/oauth/usage"]["seven_day"]
+        week.update(utilization=55, resets_at=(self.now + timedelta(hours=3)).isoformat())
+        self.assertEqual(self.run_cli("--pick"), (0, "claude-code\n"))
+        _, output = self.run_cli("--agent")
+        self.assertIn("use it before it expires", json.loads(output)["reason"])
+
+    def test_weekly_reset_beyond_expiring_window_keeps_reset_bonus(self):
+        week = self.payloads["https://api.anthropic.com/api/oauth/usage"]["seven_day"]
+        week.update(utilization=55, resets_at=(self.now + timedelta(hours=13)).isoformat())
+        self.assertEqual(self.run_cli("--pick"), (0, "codex\n"))
+
+    def test_wait_suggested_for_expiring_harness_on_five_hour_gate(self):
+        usage = self.payloads["https://api.anthropic.com/api/oauth/usage"]
+        usage["seven_day"].update(utilization=55, resets_at=(self.now + timedelta(hours=3)).isoformat())
+        usage["five_hour"] = {"utilization": 95, "resets_at": (self.now + timedelta(minutes=30)).isoformat()}
+        self.assertEqual(self.run_cli("--pick"), (0, "codex\n"))
+        _, output = self.run_cli("--agent")
+        self.assertEqual(json.loads(output)["wait_option"]["harness"], "claude-code")
+
     def test_reset_failure_keeps_usage_and_falls_back_to_existing_pick(self):
         self.payloads["https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"] = (
             urllib.error.HTTPError("unused", 503, "Unavailable", {}, None))
