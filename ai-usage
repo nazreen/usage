@@ -2,7 +2,8 @@
 """Print remaining Claude Code and Codex plan usage, one line per tool.
 
 Uses the same endpoints as CodexBar / claude-monitor style tools:
-- Claude: GET api.anthropic.com/api/oauth/usage (token from macOS keychain)
+- Claude: a recent snapshot of the rate_limits Claude Code passes to its statusline,
+          else GET api.anthropic.com/api/oauth/usage (token from macOS keychain)
 - Codex:  GET chatgpt.com/backend-api/wham/usage (token from ~/.codex/auth.json)
 - Resets: GET chatgpt.com/backend-api/wham/rate-limit-reset-credits (same Codex token)
 
@@ -11,8 +12,11 @@ with the lowest weekly pace, subtracting 100 points per available Codex reset.
 Banked resets are displayed but never redeemed; current quota must still be usable.
 
 --pick prints only the recommended harness name, or "none" and exits 1.
+
+On HTTP 429 it waits out Retry-After without new requests and shows the last
+good response, marked stale.
 """
-import json, os, subprocess, sys, time, urllib.request
+import json, os, subprocess, sys, time, urllib.error, urllib.request
 from datetime import datetime, timezone
 
 BAR = 10
@@ -23,25 +27,81 @@ MIN_5H_LEFT = 10.0
 WAIT_MINUTES = 60
 # Reuse API responses this many seconds, so repeated runs don't hit rate limits.
 CACHE_TTL = 60
+# The Claude usage endpoint allows only a few requests per token, so cache it longer.
+CLAUDE_CACHE_TTL = 300
+# After a 429 without a usable Retry-After, wait this many seconds before asking again.
+DEFAULT_RETRY_AFTER = 300
+# While rate limited, show a cached response up to this old, marked stale.
+STALE_MAX = 3 * 3600
+# Use a statusline snapshot of Claude rate limits written within this many seconds.
+STATUSLINE_MAX_AGE = 600
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "ai-usage")
 
 
-def get(url, headers, name):
-    path = os.path.join(CACHE_DIR, f"{name}.json")
-    try:
-        if time.time() - os.path.getmtime(path) < CACHE_TTL:
-            with open(path) as f:
-                return json.load(f)
-    except (OSError, ValueError):
-        pass
-    req = urllib.request.Request(url, headers={"User-Agent": "ai-usage", **headers})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        d = json.load(r)
+def write_private(path, text):
     try:
         os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
-            json.dump(d, f)
+            f.write(text)
+    except OSError:
+        pass
+
+
+def retry_after(headers):
+    try:
+        secs = int(float((headers or {}).get("Retry-After")))
+    except (TypeError, ValueError):
+        secs = 0
+    # Some 429s send Retry-After: 0, which would mean retrying at once.
+    return secs if secs > 0 else DEFAULT_RETRY_AFTER
+
+
+def stale(path, until_ts):
+    """Last good response while rate limited, or an error when there is none."""
+    try:
+        age = time.time() - os.path.getmtime(path)
+        if age < STALE_MAX:
+            with open(path) as f:
+                d = json.load(f)
+            d["_stale_secs"] = int(age)
+            return d
+    except (OSError, ValueError):
+        pass
+    wait = max(0, int(until_ts - time.time()))
+    raise RuntimeError(f"rate limited (HTTP 429), retry in {wait // 60}m {wait % 60}s")
+
+
+def get(url, headers, name, ttl=CACHE_TTL):
+    path = os.path.join(CACHE_DIR, f"{name}.json")
+    blocked = os.path.join(CACHE_DIR, f"{name}.blocked")
+    try:
+        if time.time() - os.path.getmtime(path) < ttl:
+            with open(path) as f:
+                return json.load(f)
+    except (OSError, ValueError):
+        pass
+    # Requests sent while rate limited can extend the limit, so wait out Retry-After.
+    try:
+        with open(blocked) as f:
+            until_ts = float(f.read())
+    except (OSError, ValueError):
+        until_ts = 0
+    if until_ts > time.time():
+        return stale(path, until_ts)
+    req = urllib.request.Request(url, headers={"User-Agent": "ai-usage", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code != 429:
+            raise
+        until_ts = time.time() + retry_after(e.headers)
+        write_private(blocked, str(until_ts))
+        return stale(path, until_ts)
+    write_private(path, json.dumps(d))
+    try:
+        os.remove(blocked)
     except OSError:
         pass
     return d
@@ -63,7 +123,40 @@ def window(used_pct, reset, window_secs):
     return w
 
 
+def claude_statusline():
+    """Claude rate limits from the snapshot a Claude Code statusline script writes.
+
+    Claude Code (2.1.80+) passes rate_limits to its statusline on stdin, so reading a
+    snapshot avoids the rate-limited usage endpoint. See README for the writer.
+    """
+    try:
+        with open(os.path.join(CACHE_DIR, "claude-statusline.json")) as f:
+            snap = json.load(f)
+        now = time.time()
+        if now - float(snap["written_at"]) > STATUSLINE_MAX_AGE:
+            return None
+        out = {}
+        for key, name, secs in (("seven_day", "weekly", WEEK), ("five_hour", "five_hour", 5 * 3600)):
+            w = snap["rate_limits"].get(key)
+            if not w:
+                continue
+            r = float(w["resets_at"])
+            # A window that reset after the snapshot was written has stale usage.
+            if r <= now:
+                return None
+            out[name] = window(w.get("used_percentage"), datetime.fromtimestamp(r, timezone.utc), secs)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    if "weekly" not in out:
+        return None
+    out["source"] = "statusline"
+    return out
+
+
 def claude():
+    snap = claude_statusline()
+    if snap:
+        return snap
     # Several items can share this service name (e.g. acct "unknown" holding only
     # mcpOAuth); prefer the one Claude Code writes under the login user.
     token = None
@@ -78,8 +171,10 @@ def claude():
     if not token:
         raise RuntimeError("no claude.ai login in keychain; run /login in claude")
     d = get("https://api.anthropic.com/api/oauth/usage",
-            {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"}, "claude-code")
-    out = {}
+            {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"}, "claude-code",
+            ttl=CLAUDE_CACHE_TTL)
+    out = {"source": "api"}
+    mark_stale(out, d)
     for key, name, secs in (("seven_day", "weekly", WEEK), ("five_hour", "five_hour", 5 * 3600)):
         w = d.get(key)
         if w:
@@ -100,6 +195,7 @@ def codex():
     rl = d.get("rate_limit") or {}
     wins = [w for w in (rl.get("primary_window"), rl.get("secondary_window")) if w]
     out = {}
+    mark_stale(out, d)
     # A window of up to 6 hours is the 5-hour window. Weekly = window of ~7 days,
     # or the only other window the plan returns.
     for w in wins:
@@ -116,6 +212,11 @@ def codex():
         # Reset metadata is optional: keep ordinary usage and recommendations working.
         out["resets"] = {"available_count": None, "error": str(e)}
     return out
+
+
+def mark_stale(out, d):
+    if "_stale_secs" in d:
+        out["stale_minutes"] = d["_stale_secs"] // 60
 
 
 def codex_resets(headers):
@@ -306,6 +407,8 @@ def main():
                 parts.append(seg("5h", d["five_hour"], False, TOOL_COLOR[name]))
             if "resets" in d:
                 parts.append(reset_seg(d["resets"]))
+            if "stale_minutes" in d:
+                parts.append(c(DIM, f"(stale {d['stale_minutes']}m, rate limited)"))
             print(c(LABEL, f"{label:<12}") + "   ".join(parts))
         rec, reason, _, _ = recommend(data)
         print(c(LABEL, f"{'Use':<12}") + c(OK, rec or "none") + " " + c(DIM, f"({reason})"))
