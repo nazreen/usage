@@ -8,6 +8,8 @@ Uses the same endpoints as CodexBar / claude-monitor style tools:
 
 --agent prints JSON for agents choosing a harness: it recommends the one
 with the lowest weekly pace, subtracting 100 points per available Codex reset.
+A harness whose weekly window resets within EXPIRING_HOURS comes first, since
+its unused quota is lost at the reset.
 Banked resets are displayed but never redeemed; current quota must still be usable.
 
 --pick prints only the recommended harness name, or "none" and exits 1.
@@ -21,6 +23,8 @@ WEEK = 7 * 86400
 MIN_5H_LEFT = 10.0
 # Suggest waiting for a skipped harness whose 5-hour window resets within this many minutes.
 WAIT_MINUTES = 60
+# A weekly window resetting within this many hours is used first: its unused quota expires.
+EXPIRING_HOURS = 12
 # Reuse API responses this many seconds, so repeated runs don't hit rate limits.
 CACHE_TTL = 60
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "ai-usage")
@@ -144,8 +148,21 @@ def selection_pace(d):
     return d["weekly"]["pace_delta_pct"] - 100 * reset_count(d)
 
 
+def expiring(d):
+    reset = d["weekly"].get("_reset")
+    return bool(reset) and (reset - datetime.now(timezone.utc)).total_seconds() <= EXPIRING_HOURS * 3600
+
+
+def rank(d):
+    """Sort key: expiring weekly windows first (most behind pace first), then selection pace."""
+    return (0, d["weekly"]["pace_delta_pct"]) if expiring(d) else (1, selection_pace(d))
+
+
 def pace_description(name, d):
     delta = d["weekly"]["pace_delta_pct"]
+    if expiring(d):
+        return (f"{name} weekly window resets in {until(d['weekly']['_reset'])} with "
+                f"{d['weekly']['left_pct']:.0f}% unused; use it before it expires")
     description = f"{name} weekly usage is {abs(delta)} pts {'behind' if delta < 0 else 'ahead of'} week elapsed"
     count = reset_count(d)
     if count:
@@ -230,15 +247,16 @@ def recommend(data):
             if fh["_reset"]:
                 mins = (fh["_reset"] - datetime.now(timezone.utc)).total_seconds() / 60
                 if mins <= WAIT_MINUTES:
-                    waitable.append((selection_pace(d), name, max(0, int(mins))))
+                    waitable.append((rank(d), name, max(0, int(mins))))
             continue
-        candidates.append((selection_pace(d), name))
+        candidates.append((rank(d), name))
     notes = [f"{n} skipped: no usage data" for n in unavailable] + skipped
     candidates.sort()
     waitable.sort()
     wait = None
     if waitable and (not candidates or waitable[0][0] < candidates[0][0]):
-        delta, name, mins = waitable[0]
+        _, name, mins = waitable[0]
+        delta = selection_pace(data[name])
         wait = {"harness": name, "resets_in_minutes": mins,
                 "pace_delta_pct": data[name]["weekly"]["pace_delta_pct"],
                 "selection_pace_pct": delta}
@@ -250,9 +268,10 @@ def recommend(data):
     reason = pace_description(name, data[name])
     if len(candidates) > 1:
         other = candidates[1][1]
-        reason += f"; {other} selection pace is {candidates[1][0]:+} pts"
+        reason += f"; {other} selection pace is {selection_pace(data[other]):+} pts"
         if reset_count(data[other]):
-            reason += f" ({reset_count(data[other])} banked resets)"
+            n = reset_count(data[other])
+            reason += f" ({n} banked reset{'s' if n != 1 else ''})"
     return name, "; ".join([reason] + notes), unavailable, wait
 
 
@@ -288,11 +307,13 @@ def main():
             "unavailable_harnesses": unavailable,
             "wait_option": wait,
             "rule": "prefer the harness with the lowest selection_pace_pct "
-                    "(weekly pace_delta_pct minus 100 points per unexpired, supported banked reset); "
+                    "(weekly pace_delta_pct minus 100 points per unexpired, supported banked reset), "
+                    f"except that a weekly window resetting within {EXPIRING_HOURS} h comes first, "
+                    "lowest pace_delta_pct first, because its unused quota expires; "
                     f"skip any with 0% weekly left or under {MIN_5H_LEFT:.0f}% five_hour left; "
                     "resets are never redeemed, and unknown reset counts give no bonus; "
                     f"wait_option names a skipped harness whose five_hour window resets within "
-                    f"{WAIT_MINUTES} min and whose selection pace is better",
+                    f"{WAIT_MINUTES} min and that ranks better by the same rule",
             "harnesses": {k: strip(v) for k, v in data.items()},
         }, indent=2))
     else:

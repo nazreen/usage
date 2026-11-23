@@ -47,9 +47,11 @@ Prints JSON with `recommended_harness`, a `reason`, the `rule` used, and the raw
 
 The recommended harness is the one with the lowest `selection_pace_pct`: weekly `pace_delta_pct` (weekly % used minus % of the week elapsed), minus 100 points per available banked reset. For example, Codex at +40 points with one reset scores -60 and is preferred over Claude Code at -20. This ranking heuristic gives Codex credit for its reserve weekly allowances. Unknown reset counts give no bonus. The usage bars and window percentages continue to show actual current usage.
 
+One exception comes before that ranking: a harness whose weekly window resets within 12 hours is picked first, because its unused quota expires at the reset. Banked resets do not matter for this check. If both harnesses reset that soon, the one furthest behind its weekly pace (lowest `pace_delta_pct`) wins. For example, Claude Code with 45% left and a reset in 3 hours is picked over Codex with a banked reset.
+
 A harness is skipped if it has 0% weekly quota left, under 10% of its 5-hour quota left, or no weekly window. Banked resets do not bypass those checks: this CLI never redeems them. When Codex is skipped with resets available, `reason` suggests redeeming one. `reason` names each skipped harness and why. A harness whose usage could not be fetched is listed in `unavailable_harnesses` and named in `reason`. If no harness has usable data, `recommended_harness` is `null`.
 
-`wait_option` is set when a harness was skipped only for its 5-hour window, that window resets within 60 minutes, and its selection pace is better than the recommended harness (or there is none). It gives `harness`, `resets_in_minutes`, the actual weekly `pace_delta_pct`, and `selection_pace_pct`. Otherwise it is `null`. The default output adds the same advice to `Use`, for example `or wait 0h 53m for claude-code (selection pace +5.4 pts)`.
+`wait_option` is set when a harness was skipped only for its 5-hour window, that window resets within 60 minutes, and it ranks better than the recommended harness by the same rule (or there is none). It gives `harness`, `resets_in_minutes`, the actual weekly `pace_delta_pct`, and `selection_pace_pct`. Otherwise it is `null`. The default output adds the same advice to `Use`, for example `or wait 0h 53m for claude-code (selection pace +5.4 pts)`.
 
 An agent rule might say: "Before picking a harness, run `ai-usage --agent` and use `recommended_harness`."
 
